@@ -9,13 +9,13 @@ use clap::Parser as ClapParser;
 use vcd::{Parser, Value, ScopeItem, IdCode, TimescaleUnit};
 use vcd::Command::{ChangeScalar, Timestamp};
 
-/// A tool to merge and resethronize two VCD files based on a common reset signal.
+/// A tool to merge and resynchronize VCD files based on a common reset signal.
 #[derive(ClapParser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// Path to the first VCD file
     #[arg(short, long)]
-    vcd_file1: PathBuf,
+    vcd_file1: PathBuf, //XXX files : Vec<PathBuf>
 
     /// Path to the second VCD file
     #[arg(short, long)]
@@ -30,14 +30,57 @@ struct Args {
     output_file: PathBuf,
 }
 
-fn open_vcd(file_path: &PathBuf) -> Parser<BufReader<File>> {
-    let file = File::open(file_path).expect("Unable to open file");
-    let file = BufReader::new(file);
-    Parser::new(file)
+type HeaderValues = Vec<(String, IdCode)>;
+type Data = BTreeMap<u64, Vec<(u32, Value)>>;
+
+pub struct VCD
+{
+    pub tsv : u32,
+    pub timescale : TimescaleUnit,
+    pub header : HeaderValues,
+    pub data : Data,
+    pub rst_end : u64,
+    pub rst_id : IdCode,
 }
 
+impl VCD
+{
+    pub fn new(file_path : &PathBuf, reset_signal : &str) -> Result<VCD>
+    {
+        let mut parser = Parser::new(BufReader::new(File::open(file_path)?));
 
-type HeaderValues = Vec<(String, IdCode)>;
+        let parsed_header = parser.parse_header()?;
+        let (tsv, timescale) = parsed_header.timescale.context("Timescale not found in VCD 1")?;
+        let header = collect_header(&parsed_header.items);
+        let split = reset_signal.split(".").collect::<Vec<&str>>();
+        let rst_id = parsed_header.find_var(&split).context("Reset signal not found in vcd 1")?.code;
+        let (data, rst_end) = collect_data(&header, &mut parser, rst_id);
+        println!("Reset signal end found at : {}", rst_end);
+
+        Ok(VCD{ tsv, timescale, header, data, rst_id, rst_end })
+    }
+
+    pub fn merge(&mut self, vcd : VCD)
+    {
+        let timeskew = self.rst_end - vcd.rst_end;
+
+        let header_id_start = self.header.len() as u32;
+        // not working or name are merged ?
+        self.header.extend(vcd.header.clone());
+        //println!("HEADER MERGED {:?}", self.header);
+
+        //XXX skip same reset of merged signal or rename it ?
+        for (timestamp, data) in vcd.data.iter()
+        {
+            let synced = timestamp - timeskew;
+            let entry = self.data.entry(synced).or_insert_with(Vec::new);
+            for (id, value) in data
+            {
+                entry.push((*id + header_id_start, *value));
+            }
+        }
+    }
+}
 
 fn collect_header(items: &[ScopeItem]) -> HeaderValues {
     let mut results = Vec::new();
@@ -73,59 +116,6 @@ fn collect_header(items: &[ScopeItem]) -> HeaderValues {
     recursive_collect(items, "", &mut results);
     results
 }
-
-fn search_in_scopes(items: &[ScopeItem], reset_signal: &str) -> Option<IdCode> {
-    for item in items {
-        match item {
-            ScopeItem::Var(var) if var.reference == reset_signal => {
-                return Some(var.code);
-            }
-            ScopeItem::Scope(scope) => {
-                if let Some(id_code) = search_in_scopes(&scope.items, reset_signal) {
-                    return Some(id_code);
-                }
-            }
-            _ => (),
-        }
-    }
-    None
-}
-
-fn find_id_codes<T>(vcd_1: &mut Parser<T>, vcd_2: &mut Parser<T>, reset_signal: &str) -> Result<(HeaderValues, IdCode, HeaderValues, IdCode)>
-where
-    T: std::io::BufRead,
-{
-    let vcd_1_header = vcd_1.parse_header()?;
-    let (tsv_1, timescale_1) = vcd_1_header.timescale.context("Timescale not found in VCD 1")?;
-    let vcd_2_header = vcd_2.parse_header()?;
-    let (tsv_2, timescale_2) = vcd_2_header.timescale.context("Timescale not found in VCD 2")?;
-
-    if tsv_1 != tsv_2
-    {
-        bail!("Error: Timescale values are different: {} {}", tsv_1, tsv_2);
-    }
-
-    if timescale_1 != timescale_2
-    {
-        bail!("Error: Timescale units are different: {} {}", timescale_1, timescale_2);
-    }
-
-    let header_1 = collect_header(&vcd_1_header.items);
-    let header_2 = collect_header(&vcd_2_header.items);
-
-    //XXX use that and split at .
-    //vcd_1_header.find_var([]
-    let id_code_1 = search_in_scopes(&vcd_1_header.items, reset_signal)
-        .ok_or_else(|| anyhow::anyhow!("Error: Sync signal not found in VCD 1"))?;
-
-    let id_code_2 = search_in_scopes(&vcd_2_header.items, reset_signal)
-        .ok_or_else(|| anyhow::anyhow!("Error: Sync signal not found in VCD 2"))?;
-
-    Ok((header_1, id_code_1, header_2, id_code_2))
-}
-
-pub type Data = BTreeMap<u64, Vec<(u32, Value)>>;
-
 
 fn collect_data<T>(header : &HeaderValues, vcd: &mut Parser<T>, id_code : IdCode) -> (Data, u64)
 where
@@ -179,28 +169,7 @@ where
     (data, reset_timestamp)
 }
 
-fn merge_data(mut header_1 : HeaderValues, data_1 : Data, header_2 : HeaderValues, data_2 : Data, timeskew : u64) -> (HeaderValues, Data)
-{
-   let mut merged = data_1;
-
-   let header_id_start = header_1.len() as u32;
-   header_1.extend(header_2.clone());
-
-   for (timestamp, data) in data_2.iter()
-   {
-      let synced = timestamp - timeskew;
-      let entry = merged.entry(synced).or_insert_with(Vec::new);
-      for (id, value) in data
-      {
-         entry.push((*id + header_id_start, *value));
-      }
-   }
-
-
-   (header_1, merged)
-}
-
-fn write_vcd(header_merged : HeaderValues, merged: Data, output_file : &PathBuf) -> Result<()>
+fn write_vcd(merged : VCD, output_file : &PathBuf) -> Result<()>
 {
     let mut writer = vcd::Writer::new(BufWriter::new(File::create(output_file)?));
     //USE REAL HeaderValues VALUE XXX
@@ -210,16 +179,20 @@ fn write_vcd(header_merged : HeaderValues, merged: Data, output_file : &PathBuf)
     writer.add_module("top")?;
     let mut header_map : HashMap<u32, IdCode>  =  HashMap::new();
 
-    for (i, (header_name, _id_code)) in header_merged.into_iter().enumerate()
+    for (i, (header_name, _id_code)) in merged.header.into_iter().enumerate()
     {
-        let id_code = writer.add_wire(1, &header_name)?;
+        //XXX create module for each to keep structure ?
+        //or for each file file1, file2 etc ?
+        let header_name = header_name.split('.').last().unwrap_or(&header_name);
+        //check to not create same name twice
+        let id_code = writer.add_wire(1, header_name)?;
         header_map.insert(i as u32, id_code);
     }
 
     writer.upscope()?;
     writer.enddefinitions()?;
 
-    for (timestamp, data) in merged
+    for (timestamp, data) in merged.data.into_iter()
     {
         writer.timestamp(timestamp)?;
         for (id, value) in data
@@ -236,33 +209,30 @@ fn main()  -> Result<()>
 {
     let args = Args::parse();
 
-    println!("parsing vcd file 1 {}", &args.vcd_file1.display());
-    let mut vcd_1 : Parser<_> = open_vcd(&args.vcd_file1);
-    println!("parsing vcd file 2 {}", &args.vcd_file1.display());
-    let mut vcd_2 : Parser<_> = open_vcd(&args.vcd_file2);
+    println!("Parsing file : {}", args.vcd_file1.display());
+    let mut vcd_1 = VCD::new(&args.vcd_file1, &args.reset_signal)?;
+    println!("Parsing file : {}", args.vcd_file2.display());
+    let mut vcd_2 = VCD::new(&args.vcd_file2, &args.reset_signal)?;
 
-    println!("searching id codes");
-    let (header_1, id_code_1, header_2, id_code_2) = find_id_codes(&mut vcd_1, &mut vcd_2, &args.reset_signal)?;
-
-    println!("searching end of reset signal");
-    let (data_1, rst_end_1) = collect_data(&header_1, &mut vcd_1, id_code_1);
-    println!("searching end of reset signal");
-    let (data_2, rst_end_2) = collect_data(&header_2, &mut vcd_2, id_code_2);
-
-    println!("first trace reset end at {}", rst_end_1);
-    println!("second trace reset end at {}", rst_end_2);
-
-    println!("merge data and syncing trace");
-    let (header_merged, data_merged) = match rst_end_1 > rst_end_2
+    if vcd_1.tsv != vcd_2.tsv
     {
-      //XXX PASSE MERGED SIGNAL NAME RESET
-      //BECAUSE WE NEED TO REMOVE IT DON'T NEED TO HAVE IT MULTIPLE TIME IN THE MERGED TRACE !
-      true => merge_data(header_1, data_1, header_2, data_2, rst_end_1 - rst_end_2),
-      false => merge_data(header_2, data_2, header_1, data_1, rst_end_2 - rst_end_1),
+        bail!("Error: Timescale values are different: {} {}", vcd_1.tsv, vcd_2.tsv);
+    }
+
+    if vcd_1.timescale != vcd_2.timescale
+    {
+        bail!("Error: Timescale units are different: {} {}", vcd_1.timescale, vcd_2.timescale);
+    }
+
+    println!("Resyncing and merging traces"); //show name ?
+    let merged = match vcd_1.rst_end > vcd_2.rst_end
+    {
+      true => { vcd_1.merge(vcd_2); vcd_1 }
+      false => { vcd_2.merge(vcd_1); vcd_2 }
     };
 
-    println!("writing merged trace");
-    write_vcd(header_merged, data_merged, &args.output_file)?;
+    println!("Writing merged trace in : {}", args.output_file.display());
+    write_vcd(merged, &args.output_file)?;
     //XXX write FST directly ?
     //but if we write fst we can't remerge with an other file ...
     //but we can take multiple file as input and merge them all
