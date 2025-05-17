@@ -1,16 +1,13 @@
 use std::fs::File;
-use std::io::{BufReader};
+use std::io::{BufReader, BufWriter};
 use std::path::PathBuf;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{Context, Result, bail};
 use clap::Parser as ClapParser;
 
-use vcd::{Parser, Value};
-use vcd::{ScopeItem, IdCode};
-use vcd::Command::ChangeScalar;
-use vcd::Command::Timestamp;
-
+use vcd::{Parser, Value, ScopeItem, IdCode, TimescaleUnit};
+use vcd::Command::{ChangeScalar, Timestamp};
 
 /// A tool to merge and resethronize two VCD files based on a common reset signal.
 #[derive(ClapParser, Debug)]
@@ -38,51 +35,7 @@ fn open_vcd(file_path: &PathBuf) -> Parser<BufReader<File>> {
     let file = BufReader::new(file);
     Parser::new(file)
 }
-/*
-fn resethronize_and_merge(
-    vcd_data1: HashMap<String, Vec<(u64, Value)>>,
-    vcd_data2: HashMap<String, Vec<(u64, Value)>>,
-    reset_signal_name: &str,
-) -> HashMap<String, Vec<(u64, Value)>> {
-    let reset_signal1 = vcd_data1.get(reset_signal_name).expect("Reset signal not found in first VCD");
-    let reset_signal2 = vcd_data2.get(reset_signal_name).expect("Reset signal not found in second VCD");
 
-    let time_offset = reset_signal2[0].0 - reset_signal1[0].0;
-
-    let mut merged_data = vcd_data1;
-
-    for (signal_name, signal_data) in vcd_data2 {
-        let adjusted_signal_data = signal_data
-            .into_iter()
-            .map(|(time, value)| (time - time_offset, value))
-            .collect();
-        merged_data.insert(signal_name, adjusted_signal_data);
-    }
-
-    merged_data
-}
-
-fn write_vcd(merged_data: HashMap<String, Vec<(u64, Value)>>, output_file_path: &str) {
-    let mut writer = VcdWriter::new(File::create(output_file_path).expect("Unable to create file"), Timescale::Ns).expect("Unable to create VCD writer");
-
-    for (signal_name, signal_data) in merged_data {
-        let var = Variable::new(
-            signal_name.clone(),
-            1,
-            Variable::VarType::Wire,
-            Scope::new("top", Scope::ScopeType::Module),
-        );
-        writer.add_var(&var).expect("Unable to add variable");
-
-        for (time, value) in signal_data {
-            writer.change_value(&var, time, value).expect("Unable to change value");
-        }
-    }
-
-    writer.finish().expect("Unable to finish writing VCD");
-}
-*
-*/
 
 type HeaderValues = Vec<(String, IdCode)>;
 
@@ -171,16 +124,23 @@ where
     Ok((header_1, id_code_1, header_2, id_code_2))
 }
 
-pub type Data = HashMap<u64, Vec<(IdCode, Value)>>;
+pub type Data = BTreeMap<u64, Vec<(u32, Value)>>;
 
 
-fn collect_data<T>(vcd : &mut Parser<T>, id_code : IdCode) -> (Data, u64)
+fn collect_data<T>(header : &HeaderValues, vcd: &mut Parser<T>, id_code : IdCode) -> (Data, u64)
 where
     T: std::io::BufRead,
 {
-    let mut data : HashMap<u64, Vec<(IdCode, Value)>> = HashMap::new();
+    let mut data : Data = Data::new();
     let mut current_timestamp = 0;
     let mut reset_timestamp = 0;
+
+    let mut id_map : HashMap<IdCode, u32> = HashMap::new();
+
+    for (i, (_, id_code)) in header.iter().enumerate()
+    {
+        id_map.insert(*id_code, i as u32);
+    }
 
     for cmd in vcd.into_iter().flatten()
     {
@@ -191,7 +151,7 @@ where
                 //we collect the data
                 data.entry(current_timestamp)
                     .or_insert_with(Vec::new)
-                    .push((id, value));
+                    .push((id_map[&id], value));
                 //either we stop at fist 0 or fist 1
                 //depending if logic low or high
                 //or we stop at last 1 value of reset
@@ -202,18 +162,12 @@ where
                 //so we wait for last reset == 1 value
                 //because it mean reset is not active anymore
                 //and get that timestamp to reset
-                //and return it so we can reset the two traces
-                if id == id_code && value == true.into() // && value == 0 if active high
+                //and return it so we can sync the two traces
+                if id == id_code && value == true.into()
                 {
                     reset_timestamp = current_timestamp;
-                    //println!("id {} value {}", id, value);
-                    //break a first 1 ?
-                    //or break at first 0 ?
-                    //break;
-
                 }
             },
-
             Timestamp(timestamp) =>
             {
               current_timestamp = timestamp;
@@ -225,25 +179,57 @@ where
     (data, reset_timestamp)
 }
 
-fn merge_data(header_1 : HeaderValues, data_1 : Data, header_2 : HeaderValues, data_2 : Data, timeskew : u64) -> Data
+fn merge_data(mut header_1 : HeaderValues, data_1 : Data, header_2 : HeaderValues, data_2 : Data, timeskew : u64) -> (HeaderValues, Data)
 {
    let mut merged = data_1;
-   //create new header for new values
 
-   println!("Header 1 {:?}", header_1);
-   println!("Header 2 {:?}", header_2);
+   let header_id_start = header_1.len() as u32;
+   header_1.extend(header_2.clone());
 
    for (timestamp, data) in data_2.iter()
    {
       let synced = timestamp - timeskew;
-      //We need to change the ChangeScalar, id by there new id
-      //let updated_values = update_value(header_map, values);
-
-      //merged.insert(timestamp, )
+      let entry = merged.entry(synced).or_insert_with(Vec::new);
+      for (id, value) in data
+      {
+         entry.push((*id + header_id_start, *value));
+      }
    }
 
 
-   merged
+   (header_1, merged)
+}
+
+fn write_vcd(header_merged : HeaderValues, merged: Data, output_file : &PathBuf) -> Result<()>
+{
+    let mut writer = vcd::Writer::new(BufWriter::new(File::create(output_file)?));
+    //USE REAL HeaderValues VALUE XXX
+    writer.timescale(1, TimescaleUnit::NS)?;
+
+    //create module ask name in entry ??
+    writer.add_module("top")?;
+    let mut header_map : HashMap<u32, IdCode>  =  HashMap::new();
+
+    for (i, (header_name, _id_code)) in header_merged.into_iter().enumerate()
+    {
+        let id_code = writer.add_wire(1, &header_name)?;
+        header_map.insert(i as u32, id_code);
+    }
+
+    writer.upscope()?;
+    writer.enddefinitions()?;
+
+    for (timestamp, data) in merged
+    {
+        writer.timestamp(timestamp)?;
+        for (id, value) in data
+        {
+          let id_code = header_map[&id];
+          writer.change_scalar(id_code, value)?;
+        }
+    }
+
+    Ok(())
 }
 
 fn main()  -> Result<()>
@@ -259,14 +245,15 @@ fn main()  -> Result<()>
     let (header_1, id_code_1, header_2, id_code_2) = find_id_codes(&mut vcd_1, &mut vcd_2, &args.reset_signal)?;
 
     println!("searching end of reset signal");
-    let (data_1, rst_end_1) = collect_data(&mut vcd_1, id_code_1);
+    let (data_1, rst_end_1) = collect_data(&header_1, &mut vcd_1, id_code_1);
     println!("searching end of reset signal");
-    let (data_2, rst_end_2) = collect_data(&mut vcd_2, id_code_2);
+    let (data_2, rst_end_2) = collect_data(&header_2, &mut vcd_2, id_code_2);
 
     println!("first trace reset end at {}", rst_end_1);
     println!("second trace reset end at {}", rst_end_2);
 
-    let merged = match rst_end_1 > rst_end_2
+    println!("merge data and syncing trace");
+    let (header_merged, data_merged) = match rst_end_1 > rst_end_2
     {
       //XXX PASSE MERGED SIGNAL NAME RESET
       //BECAUSE WE NEED TO REMOVE IT DON'T NEED TO HAVE IT MULTIPLE TIME IN THE MERGED TRACE !
@@ -274,14 +261,13 @@ fn main()  -> Result<()>
       false => merge_data(header_2, data_2, header_1, data_1, rst_end_2 - rst_end_1),
     };
 
-    //println!("merging header and data");
-    //XXX we must first merge header and reassign
-    //a code for each signal
-    //because we have now more signals
-    //and different signals may have same symbols in two file
-
-    //println!("writing merged trace");
-    //write_vcd(merged_data, "merged_trace.vcd");
+    println!("writing merged trace");
+    write_vcd(header_merged, data_merged, &args.output_file)?;
+    //XXX write FST directly ?
+    //but if we write fst we can't remerge with an other file ...
+    //but we can take multiple file as input and merge them all
+    //and then write fst rather than launching the tool multiple time ...
+    //write_fst(merged, &args.output_file)?;
 
     Ok(())
 }
