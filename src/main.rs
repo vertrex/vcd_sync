@@ -1,13 +1,12 @@
 use std::fs::File;
-use std::io::{BufReader, BufWriter};
 use std::path::PathBuf;
+use std::io::{BufReader, BufWriter};
 use std::collections::{BTreeMap, HashMap};
 
-use anyhow::{Context, Result, bail};
 use clap::Parser as ClapParser;
-
-use vcd::{Parser, Value, ScopeItem, IdCode, TimescaleUnit};
+use anyhow::{Context, Result, bail};
 use vcd::Command::{ChangeScalar, Timestamp};
+use vcd::{Parser, Value, ScopeItem, IdCode, TimescaleUnit};
 
 /// A tool to merge and resynchronize VCD files based on a common reset signal.
 #[derive(ClapParser, Debug)]
@@ -31,7 +30,7 @@ struct Args {
 }
 
 // Signal name / Id code
-type Signals = Vec<(String, IdCode)>;
+type SignalsCode = Vec<(String, IdCode)>;
 // Time stamp  : [Value Changed]
 type TimestampValues = BTreeMap<u64, Vec<(u32, Value)>>;
 
@@ -39,7 +38,7 @@ pub struct VCD
 {
     pub timescale_value: u32,
     pub timescale_unit : TimescaleUnit,
-    pub signals : Signals,
+    pub signals : Vec<String>,
     pub values : TimestampValues,
     pub rst_end : u64,
     pub rst_id : IdCode,
@@ -53,12 +52,13 @@ impl VCD
 
         let parsed_header = parser.parse_header()?;
         let (timescale_value, timescale_unit) = parsed_header.timescale.context("Timescale not found in VCD 1")?;
-        let signals = signals(&parsed_header.items);
         let split = reset_signal.split(".").collect::<Vec<&str>>();
         let rst_id = parsed_header.find_var(&split).context("Reset signal not found in vcd 1")?.code;
-        let (values, rst_end) = collect_values(&signals, &mut parser, rst_id);
+        let signals_id = signals(&parsed_header.items);
+        let (values, rst_end) = collect_values(&signals_id, &mut parser, rst_id);
         println!("Reset signal end found at : {}", rst_end);
 
+        let signals : Vec<String> = signals_id.into_iter().map(|(sig_name, _sig_id)| (sig_name)).collect();
         Ok(VCD{ timescale_value, timescale_unit, signals, values, rst_id, rst_end })
     }
 
@@ -67,9 +67,10 @@ impl VCD
         let timeskew = self.rst_end - vcd.rst_end;
 
         let signals_id_start = self.signals.len() as u32;
-        // not working or name are merged ?
-        self.signals.extend(vcd.signals.clone());
-        //println!("HEADER MERGED {:?}", self.header);
+        //XXX if signals name already exist we must rename it
+        //or in gtkwave it will not be shown
+        //it's more a bug of gtkwave
+        self.signals.extend(vcd.signals);
 
         //XXX skip same reset of merged signal or rename it ?
         for (timestamp, values) in vcd.values.iter()
@@ -84,7 +85,7 @@ impl VCD
     }
 }
 
-fn signals(items: &[ScopeItem]) -> Signals {
+fn signals(items: &[ScopeItem]) -> SignalsCode {
     let mut results = Vec::new();
 
     fn recursive_collect(
@@ -119,7 +120,7 @@ fn signals(items: &[ScopeItem]) -> Signals {
     results
 }
 
-fn collect_values<T>(signals: &Signals, vcd: &mut Parser<T>, id_code : IdCode) -> (TimestampValues, u64)
+fn collect_values<T>(signals: &SignalsCode, vcd: &mut Parser<T>, id_code : IdCode) -> (TimestampValues, u64)
 where
     T: std::io::BufRead,
 {
@@ -174,7 +175,7 @@ fn write_vcd(merged : VCD, output_file : &PathBuf) -> Result<()>
     writer.add_module("top")?;
     let mut signals_map : HashMap<u32, IdCode>  =  HashMap::new();
 
-    for (i, (signal_name, _id_code)) in merged.signals.into_iter().enumerate()
+    for (i, signal_name) in merged.signals.into_iter().enumerate()
     {
         //XXX create module for each to keep structure ?
         //or for each file file1, file2 etc ?
