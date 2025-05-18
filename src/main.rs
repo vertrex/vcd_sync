@@ -69,6 +69,8 @@ impl VCD
         let signals_id_start = self.signals.len() as u32;
         //XXX we should remove all 'none' signals
         //created by acquisiton tool
+
+        // Handle duplicate signals by appending "_2" to the signal name
         for vcd_signal in &vcd.signals
         {
             match self.signals.contains(vcd_signal)
@@ -78,6 +80,7 @@ impl VCD
             }
         }
 
+        // Adjust timestamps and merge values
         for (timestamp, values) in vcd.values.iter()
         {
             let synced = timestamp + timeskew;
@@ -88,8 +91,7 @@ impl VCD
             }
         }
 
-        //we set everything at 0 at timestamp 0 to avoid Error
-        //in gtkwave
+        // Initialize all signals to 0 at timestamp 0 to avoid errors in GTKWavee
         let mut init = Vec::new();
         for id in 0..self.signals.len()
         {
@@ -247,8 +249,6 @@ fn main()  -> Result<()>
           true =>  { main_vcd.merge(current_vcd); main_vcd }
           false => { current_vcd.merge(main_vcd); current_vcd }
         };
-
-
     }
 
     println!("Writing merged trace in : {}", args.output_file.display());
