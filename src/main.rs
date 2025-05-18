@@ -64,24 +64,42 @@ impl VCD
 
     pub fn merge(&mut self, vcd : VCD)
     {
+        println!("Merging files with a timeskew of {} {}",
+                 self.rst_end - vcd.rst_end,
+                 self.timescale_unit);
         let timeskew = self.rst_end - vcd.rst_end;
 
         let signals_id_start = self.signals.len() as u32;
-        //XXX if signals name already exist we must rename it
-        //or in gtkwave it will not be shown
-        //it's more a bug of gtkwave
-        self.signals.extend(vcd.signals);
+        //XXX we should remove all 'none' signals
+        //created by acquisiton tool
+        for vcd_signal in &vcd.signals
+        {
+            match self.signals.contains(vcd_signal)
+            {
+                true => self.signals.push(format!("{}_2", vcd_signal)),
+                false => self.signals.push(vcd_signal.clone()),
+            }
+        }
 
-        //XXX skip same reset of merged signal or rename it ?
         for (timestamp, values) in vcd.values.iter()
         {
-            let synced = timestamp - timeskew;
+            let synced = timestamp + timeskew;
             let entry = self.values.entry(synced).or_insert_with(Vec::new);
             for (id, value) in values
             {
                 entry.push((*id + signals_id_start, *value));
             }
         }
+
+        //we set everything at 0 at timestamp 0 to avoid Error
+        //in gtkwave
+        let mut init = Vec::new();
+        for id in 0..self.signals.len()
+        {
+            // set it low by default ?
+            init.push((id as u32, Value::V0));
+        }
+        self.values.insert(0, init);
     }
 }
 
@@ -173,8 +191,9 @@ fn write_vcd(merged : VCD, output_file : &PathBuf) -> Result<()>
 
     //create module ask name in entry ??
     writer.add_module("top")?;
-    let mut signals_map : HashMap<u32, IdCode>  =  HashMap::new();
 
+    //REMOVE ALL NONE SIGNALS created by acquisiton tool ?
+    let mut signals_map : HashMap<u32, IdCode>  =  HashMap::new();
     for (i, signal_name) in merged.signals.into_iter().enumerate()
     {
         //XXX create module for each to keep structure ?
