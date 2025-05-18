@@ -12,13 +12,9 @@ use vcd::{Parser, Value, ScopeItem, IdCode, TimescaleUnit};
 #[derive(ClapParser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Path to the first VCD file
-    #[arg(short, long)]
-    vcd_file1: PathBuf, //XXX files : Vec<PathBuf>
-
-    /// Path to the second VCD file
-    #[arg(short, long)]
-    vcd_file2: PathBuf,
+    /// Path to the VCD files
+    #[arg(num_args = 2..)]
+    vcd_files: Vec<PathBuf>,
 
     /// Name of the reset signal to resethronize on
     #[arg(short, long)]
@@ -57,7 +53,8 @@ impl VCD
         let signals_id = signals(&parsed_header.items);
         let (values, rst_end) = collect_values(&signals_id, &mut parser, rst_id);
         println!("Reset signal end found at : {}", rst_end);
-
+        //Signal are already splitted
+        //let signal_name = signal_name.split('.').next_back().unwrap_or(&signal_name);
         let signals : Vec<String> = signals_id.into_iter().map(|(sig_name, _sig_id)| (sig_name)).collect();
         Ok(VCD{ timescale_value, timescale_unit, signals, values, rst_id, rst_end })
     }
@@ -84,7 +81,7 @@ impl VCD
         for (timestamp, values) in vcd.values.iter()
         {
             let synced = timestamp + timeskew;
-            let entry = self.values.entry(synced).or_insert_with(Vec::new);
+            let entry = self.values.entry(synced).or_default();
             for (id, value) in values
             {
                 entry.push((*id + signals_id_start, *value));
@@ -117,7 +114,8 @@ fn signals(items: &[ScopeItem]) -> SignalsCode {
                     let full_reference = if current_scope.is_empty() {
                         var.reference.clone()
                     } else {
-                        format!("{}.{}", current_scope, var.reference)
+                        //format!("{}.{}", current_scope, var.reference)
+                        var.reference.clone()
                     };
                     results.push((full_reference, var.code));
                 }
@@ -160,7 +158,7 @@ where
             ChangeScalar(id, value) =>
             {
                 values.entry(current_timestamp)
-                    .or_insert_with(Vec::new)
+                    .or_default()
                     .push((id_map[&id], value));
                 //Here reset is active low
                 //so we wait for last reset == 1 value
@@ -189,19 +187,14 @@ fn write_vcd(merged : VCD, output_file : &PathBuf) -> Result<()>
     let mut writer = vcd::Writer::new(BufWriter::new(File::create(output_file)?));
     writer.timescale(merged.timescale_value, merged.timescale_unit)?;
 
-    //create module ask name in entry ??
+    //XXX get top module as arg ?
+    //use file name so it's easier to know where signal came from ?
     writer.add_module("top")?;
 
-    //REMOVE ALL NONE SIGNALS created by acquisiton tool ?
     let mut signals_map : HashMap<u32, IdCode>  =  HashMap::new();
     for (i, signal_name) in merged.signals.into_iter().enumerate()
     {
-        //XXX create module for each to keep structure ?
-        //or for each file file1, file2 etc ?
-        let signal_name = signal_name.split('.').last().unwrap_or(&signal_name);
-        //XXX check to not create same name twice or did the lib do it ?
-        let id_code = writer.add_wire(1, signal_name)?;
-        signals_map.insert(i as u32, id_code);
+        signals_map.insert(i as u32,  writer.add_wire(1, &signal_name)?);
     }
 
     writer.upscope()?;
@@ -224,38 +217,43 @@ fn main()  -> Result<()>
 {
     let args = Args::parse();
 
-    //XXX implement merge multiple files
-    //let vcd_1 = files.take(1);
-    //for file in files
+    let mut vcd_files = args.vcd_files.iter();
+    let main_vcd_file = vcd_files.next().unwrap();
+    println!("Parsing file : {}", main_vcd_file.display());
+    let mut main_vcd = VCD::new(main_vcd_file, &args.reset_signal)?;
 
-    println!("Parsing file : {}", args.vcd_file1.display());
-    let mut vcd_1 = VCD::new(&args.vcd_file1, &args.reset_signal)?;
-    println!("Parsing file : {}", args.vcd_file2.display());
-    let mut vcd_2 = VCD::new(&args.vcd_file2, &args.reset_signal)?;
-
-    if vcd_1.timescale_value != vcd_2.timescale_value
+    for current_vcd_file in vcd_files
     {
-        bail!("Error: Timescale values are different: {} {}", vcd_1.timescale_value, vcd_2.timescale_value);
+        println!("Parsing file : {}", current_vcd_file.display());
+        let mut current_vcd = VCD::new(current_vcd_file, &args.reset_signal)?;
+
+        if main_vcd.timescale_value != current_vcd.timescale_value
+        {
+            bail!("Error: Timescale values are different: {} {}",
+                  main_vcd.timescale_value,
+                  current_vcd.timescale_value);
+        }
+
+        if main_vcd.timescale_unit != current_vcd.timescale_unit
+        {
+            bail!("Error: Timescale units are different: {} {}",
+                  main_vcd.timescale_unit,
+                  current_vcd.timescale_unit);
+        }
+
+        println!("Resyncing and merging traces");
+        main_vcd = match main_vcd.rst_end > current_vcd.rst_end
+        {
+          true =>  { main_vcd.merge(current_vcd); main_vcd }
+          false => { current_vcd.merge(main_vcd); current_vcd }
+        };
+
+
     }
-
-    if vcd_1.timescale_unit != vcd_2.timescale_unit
-    {
-        bail!("Error: Timescale units are different: {} {}", vcd_1.timescale_unit, vcd_2.timescale_unit);
-    }
-
-    println!("Resyncing and merging traces"); //show name ?
-    let merged = match vcd_1.rst_end > vcd_2.rst_end
-    {
-      true => { vcd_1.merge(vcd_2); vcd_1 }
-      false => { vcd_2.merge(vcd_1); vcd_2 }
-    };
 
     println!("Writing merged trace in : {}", args.output_file.display());
-    write_vcd(merged, &args.output_file)?;
-    //XXX write FST directly ?
-    //but if we write fst we can't remerge with an other file ...
-    //but we can take multiple file as input and merge them all
-    //and then write fst rather than launching the tool multiple time ...
+    write_vcd(main_vcd, &args.output_file)?;
+    //XXX add features to write FST directly via fstlib ?
     //write_fst(merged, &args.output_file)?;
 
     Ok(())
